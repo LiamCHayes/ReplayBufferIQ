@@ -3,12 +3,13 @@ Training loop using DeepMind Control Suite to see how the replay buffer works
 """
 
 import learning_utils.DataTrackers
+import learning_utils.Memories
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributions as distributions
 from dm_control import suite
-import learning_utils
+import numpy as np
 import argparse
 import cv2
 
@@ -79,7 +80,7 @@ class Critic(nn.Module):
     def forward(self, state):
         return self.net(state)
     
-## Agent
+## Agents
 class AgentMPO:
     """
     Agent using MPO
@@ -92,9 +93,14 @@ class AgentMPO:
     def __init__(self, observation_size, action_size, epsilon=0.1, gamma = 0.95, tau = 0.001):
         # Networks
         self.actor = Actor(observation_size, action_size)
-        self.actor_target = Actor(observation_size, action_size).load_state_dict(self.actor.state_dict())
+        self.actor_target = Actor(observation_size, action_size)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+
         self.critic = Critic(observation_size)
-        self.critic_target = Critic(observation_size).load_state_dict(self.critic.state_dict())
+        self.critic_target = Critic(observation_size)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+
+        # Optimizers
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
@@ -104,8 +110,8 @@ class AgentMPO:
         self.tau = tau
 
         # Lagrange multipliers for constraints
-        self.log_alpha = nn.Parameter(torch.zeros(1, requires_grad=True))
-        self.log_beta = nn.Parameter(torch.zeros(1, requires_grad=True))
+        self.log_alpha = nn.Parameter(torch.zeros(1, requires_grad=True).to(device))
+        self.log_beta = nn.Parameter(torch.zeros(1, requires_grad=True).to(device))
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
         self.beta_optimizer = optim.Adam([self.log_beta], lr=3e-4)
 
@@ -118,16 +124,17 @@ class AgentMPO:
         """
         # Batch the tensor
         observation = torch.FloatTensor(observation).unsqueeze(0).to(device)
-        mean, std = self.actor(observation)
+        with torch.no_grad():
+            mean, std = self.actor(observation)
         action = torch.normal(mean, std)
-        return action.squeeze().detach().numpy()
+        return action.cpu().squeeze().detach().numpy()
     
     def update(self, states, actions, rewards, next_states, dones):
         """
         Updates the actor based on a replay buffer sample
         
         args:
-            states, actions, rewards, next_states, dones
+            states, actions, rewards, next_states, dones (tensor)
 
         returns:
             metrics (dictionary): critic_loss, actor_loss, kl_divergence, alpha, beta
@@ -135,7 +142,7 @@ class AgentMPO:
         # Compute critic loss
         with torch.no_grad():
             next_value_target = self.critic_target(next_states)
-            q_targets = rewards + (1 - dones) * 0.99 * next_value_target
+            q_targets = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * 0.99 * next_value_target
 
         q_values = self.critic(states)
 
@@ -166,26 +173,29 @@ class AgentMPO:
         alpha = torch.exp(self.log_alpha)
         beta = torch.exp(self.log_beta)
 
+        with torch.no_grad():
+            q_values = self.critic(states)
+
         actor_objective = torch.mean(weights * q_values)
         alpha_loss = -alpha * (kl_div - self.epsilon)
         beta_loss = -beta * (kl_div - self.epsilon)
 
         # (5) Combined actor loss
         actor_loss = -(actor_objective - alpha * kl_div - beta * (kl_div - self.epsilon))
-
-        # (6) Update actor
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
         
-        # (7) Update Lagrange multipliers
+        # (6) Update Lagrange multipliers
         self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
+        alpha_loss.backward(retain_graph=True)
         self.alpha_optimizer.step()
         
         self.beta_optimizer.zero_grad()
-        beta_loss.backward()
+        beta_loss.backward(retain_graph=True)
         self.beta_optimizer.step()
+
+        # (7) Update actor
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
 
         # Soft update of the targets
         self._soft_update(self.critic, self.critic_target)
@@ -213,10 +223,10 @@ class AgentMPO:
             )
         
 ## Fill the replay buffer 
-def fill_replay_buffer(environment, agent: AgentMPO, replay_buffer: ReplayBuffer, batch_size):
+def fill_replay_buffer(environment, agent, replay_buffer, batch_size):
     print("\nFilling replay buffer...")
 
-    while replay_buffer.size() <= batch_size:
+    while replay_buffer.len() <= batch_size:
         # Reset episode
         time_step = env.reset()
 
@@ -229,13 +239,13 @@ def fill_replay_buffer(environment, agent: AgentMPO, replay_buffer: ReplayBuffer
             # Store experience in memory
             reward = time_step.reward
             next_observation = time_step.observation['position']
-            replay_buffer.remember(observation, action, reward, next_observation, time_step.last())
+            replay_buffer.add(observation, action, reward, next_observation, time_step.last())
 
 ## Training Loop
-def train(environment, agent: AgentMPO, replay_buffer: ReplayBuffer, num_episodes, batch_size, name, report_freq):
+def train(environment, agent, replay_buffer, num_episodes, batch_size, name, report_freq):
     # Track the training loop metrics
     metrics = learning_utils.DataTrackers.TrainingLoopTracker("rewards", "actor_loss", "critic_loss")
-    mpo_metrics = learning_utils.DataTrackers.TrainingLoopTracker("time_step", "kl_divergence", "alpha", "beta")
+    mpo_metrics = learning_utils.DataTrackers.TrainingLoopTracker("kl_divergence", "alpha", "beta")
 
     # Training loop
     for e in range(num_episodes):
@@ -261,9 +271,9 @@ def train(environment, agent: AgentMPO, replay_buffer: ReplayBuffer, num_episode
             time_step = env.step(action)
 
             ## Store in replay buffer
-            reward = time_step.reward()
+            reward = time_step.reward
             next_observation = time_step.observation['position']
-            replay_buffer.remember(observation, action, reward, next_observation, time_step.last())
+            replay_buffer.add(observation, action, reward, next_observation, time_step.last())
 
             # Render and capture frame 
             if reporting:
@@ -276,8 +286,17 @@ def train(environment, agent: AgentMPO, replay_buffer: ReplayBuffer, num_episode
                 frames.append(frame)
 
             # Sample from replay buffer
-            states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
+            samp = replay_buffer.sample(batch_size)
 
+            # Convert sample to stacked tensors
+            sample = []
+            for s in samp:
+                s = [torch.tensor(a, dtype=torch.float32) for a in s]
+                sample.append(torch.stack(s).to(device))
+
+            states, actions, rewards, next_states, dones = sample
+
+            # Update models
             update_metrics = agent.update(states, actions, rewards, next_states, dones)
 
             # Parse update_metrics
@@ -286,10 +305,6 @@ def train(environment, agent: AgentMPO, replay_buffer: ReplayBuffer, num_episode
             kl_divergence = update_metrics['kl_divergence'] 
             alpha = update_metrics['alpha'] 
             beta = update_metrics['beta']
-
-            # Save MPO metrics
-            mpo_metrics.update(t, kl_divergence, alpha, beta)
-            mpo_metrics.save(f"results/{name}/mpo_metrics.csv")
 
             # Update totals
             total_reward += reward
@@ -300,12 +315,16 @@ def train(environment, agent: AgentMPO, replay_buffer: ReplayBuffer, num_episode
             if time_step.last():
                 break
 
-        # Print and save total metrics
+        # Print and save metrics
         print('Total reward: ', total_reward)
         print('Total actor loss: ', total_actor_loss)
         print('Total critic loss: ', total_critic_loss)
+
         metrics.update(total_reward, total_actor_loss, total_critic_loss)
         metrics.save(f"results/{name}/metrics.csv")
+
+        mpo_metrics.update(kl_divergence, alpha, beta)
+        mpo_metrics.save(f"results/{name}/mpo_metrics.csv")
 
         # Make a progress report video once in a while
         if reporting:
@@ -318,6 +337,9 @@ def train(environment, agent: AgentMPO, replay_buffer: ReplayBuffer, num_episode
 if __name__ == "__main__":
     # Parse args
     args = argparser()
+    batch_size = int(args.batch_size)
+    episodes = int(args.episodes)
+    report_freq = int(args.report_freq)
 
     # Load environment
     env = suite.load(domain_name="cheetah", task_name="run")
@@ -329,9 +351,9 @@ if __name__ == "__main__":
     agent = AgentMPO(observation_size, action_size)
 
     # Load replay buffer 
-    replay_buffer = ReplayBuffer() # TODO implement this
-    fill_replay_buffer(env, agent, replay_buffer, args.batch_size)
+    replay_buffer = learning_utils.Memories.ReplayBuffer(100000)
+    fill_replay_buffer(env, agent, replay_buffer, batch_size)
 
     # Training loop
-    train(env, agent, replay_buffer, args.episodes, args.batch_size, args.name, args.report_freq)
+    train(env, agent, replay_buffer, episodes, batch_size, args.name, report_freq)
 
